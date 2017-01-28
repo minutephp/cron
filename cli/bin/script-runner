@@ -1,0 +1,220 @@
+#!/usr/bin/env php
+<?php
+
+namespace Cron {
+
+    use App\Config\BootLoader;
+    use App\Model\MCronJob;
+    use App\Model\MCronLog;
+    use App\Model\User;
+    use Auryn\Injector;
+    use Carbon\Carbon;
+    use GuzzleHttp\Cookie\CookieJar;
+    use GuzzleHttp\Cookie\SetCookie;
+    use Minute\App\App;
+    use Minute\Config\Config;
+    use Minute\Database\Database;
+    use Minute\Error\CronError;
+    use Minute\Event\Dispatcher;
+    use Minute\Event\RawMailEvent;
+    use Minute\Http\Browser;
+    use Minute\Resolver\Resolver;
+    use Minute\Session\Session;
+    use Swift_Message;
+
+    error_reporting(E_ALL);
+    ini_set('display_errors', 'On');
+
+    require_once(realpath(__DIR__ . "/../../../../autoload.php"));
+
+    class ScriptRunner {
+        /*
+         * @var float
+         */
+        protected $start_time = 0;
+        /**
+         * @var string
+         */
+        protected $output = '';
+        /**
+         * @var bool
+         */
+        protected $terminated = false;
+        /**
+         * @var MCronJob
+         */
+        private $job;
+        /**
+         * @var Database
+         */
+        private $database;
+        /**
+         * @var Resolver
+         */
+        private $resolver;
+        /**
+         * @var Injector
+         */
+        private $injector;
+        /**
+         * @var Browser
+         */
+        private $browser;
+        /**
+         * @var Session
+         */
+        private $session;
+        /**
+         * @var Config
+         */
+        private $config;
+        /**
+         * @var App
+         */
+        private $app;
+        /**
+         * @var Dispatcher
+         */
+        private $dispatcher;
+
+        /**
+         * ScriptRunner constructor.
+         *
+         * @param App $app
+         * @param Database $database
+         * @param Resolver $resolver
+         * @param Injector $injector
+         * @param Browser $browser
+         * @param Session $session
+         * @param Config $config
+         * @param Dispatcher $dispatcher
+         */
+        public function __construct(App $app, Database $database, Resolver $resolver, Injector $injector, Browser $browser, Session $session, Config $config, Dispatcher $dispatcher) {
+            $this->app        = $app;
+            $this->database   = $database;
+            $this->resolver   = $resolver;
+            $this->injector   = $injector;
+            $this->browser    = $browser;
+            $this->session    = $session;
+            $this->config     = $config;
+            $this->dispatcher = $dispatcher;
+
+            $this->app->boot();
+
+            register_shutdown_function([$this, 'terminate']);
+        }
+
+        public function run($cron_job_id) {
+            /** @var MCronJob $job */
+            if ($this->job = $job = MCronJob::find($cron_job_id)) {
+                print "Starting job $job->name ($cron_job_id)\n";
+
+                $this->start_time = microtime();
+                $job->setAttribute('updated_at', Carbon::now())->setAttribute('running', 'true')->save();
+
+                if ($job->jitter > 0) {
+                    $wait = rand(1, $job->jitter);
+
+                    print "sleeping for $wait seconds..\n";
+                    sleep($wait);
+                }
+
+                ob_start();
+
+                if (!empty($job->path)) {
+                    if ($job->type === 'action') {
+                        $parts = explode('@', $job->path, 2);
+                        list($class, $function) = [$parts[0], $parts[1] ?? 'index'];
+
+                        if (is_callable([$class, $function])) {
+                            if ($args = json_decode($job->arguments ?? '[]', true)) {
+                                foreach ($args as $k => $v) {
+                                    $arguments[":" . ltrim($k, ':')] = $v;
+                                }
+                            }
+
+                            echo $this->injector->execute([$class, $function], $arguments ?? []);
+                        } else {
+                            throw new CronError("Controller $class@$function is not callable");
+                        }
+                    } elseif (($job->type === 'script') && file_exists($job->path)) {
+                        global $arguments;
+                        $arguments = $job->arguments;
+
+                        echo include($job->path);
+                    } elseif ($job->type === 'route') {
+                        $url = preg_match('/^http/i', $job->path) ? $job->path : sprintf("%s/%s", $this->config->getPublicVars('host'), ltrim($job->path, '/'));
+
+                        if ($runAs = $job->arguments) {
+                            if ($user = User::where(filter_var($runAs, FILTER_VALIDATE_EMAIL) ? 'email' : 'user_id', '=', $runAs)->first()) {
+                                $this->session->startSession($user->user_id);
+                                $cookies = new CookieJar(false);
+                                $cookie  = ['Name' => Session::COOKIE_NAME, 'Value' => $_COOKIE[Session::COOKIE_NAME], 'Domain' => "." . $this->config->getPublicVars('domain')];
+                                $cookies->setCookie(new SetCookie($cookie));
+                            }
+                        }
+
+                        print "fetching url: $url\n";
+                        echo $this->browser->getUrl($url, ['cookies' => $cookies ?? null]);
+                    }
+                }
+
+                $this->output = ob_get_contents();
+                ob_end_clean();
+
+                $this->terminate();
+            } else {
+                throw new CronError("Cron job not found: $cron_job_id");
+            }
+        }
+
+        public function terminate() {
+            if ($this->job && !$this->terminated) {
+                $this->terminated = true;
+
+                if ($this->job->running === 'true') {
+                    $this->job->running = 'false';
+                    $this->job->save();
+                }
+
+                $last = error_get_last();
+
+                if (($last['type'] === E_ERROR) || ($last['type'] === E_PARSE) || ($last['type'] === E_COMPILE_ERROR) || ($last['type'] === E_USER_ERROR)) {
+                    $error = sprintf("[FATAL] %s in %s at line %d", $last['message'], $last['file'], $last['line']);
+                }
+
+                $status = empty($error) ? 'pass' : 'fail';
+                $time   = microtime() - $this->start_time;
+
+                print "Saving output: $this->output\n";
+
+                if ($outputTo = $this->job->output_to) {
+                    if (filter_var($outputTo, FILTER_VALIDATE_EMAIL)) {
+                        $from    = sprintf('cron@%s', $this->config->getPublicVars('domain'));
+                        $subject = sprintf("Cron job %s: %s (%d)", $status, $this->job->name, $this->job->cron_job_id);
+                        $message = Swift_Message::newInstance($subject, $this->output ?: 'No output', 'text/plain')->setFrom($from)->setTo($outputTo);
+                        $event   = new RawMailEvent($message);
+
+                        $this->dispatcher->fire(RawMailEvent::MAIL_SEND_RAW, $event);
+                    } elseif (filter_var($outputTo, FILTER_VALIDATE_URL)) {
+                        $url = sprintf('%s?%s', $outputTo, http_build_query(['status' => $status, 'output' => $this->output, 'error' => $error ?? null]));
+                        $this->browser->getUrl($url);
+                    }
+                }
+
+                MCronLog::unguard(true);
+                MCronLog::updateOrCreate(['cron_job_id' => $this->job->cron_job_id, 'last_run_at' => Carbon::today(), 'result' => $status,],
+                    ['created_at' => Carbon::now(), 'run_time' => $time, 'output' => $this->output, 'error' => $error ?? null]);
+            }
+        }
+    }
+
+    /** @var ScriptRunner $runner */
+    $bootLoader = new BootLoader();
+    $injector   = $bootLoader->getInjector();
+    $runner     = $injector->make('Cron\ScriptRunner');
+
+    if ($options = getopt(null, ["input:"])) {
+        $runner->run($options['input']);
+    }
+}

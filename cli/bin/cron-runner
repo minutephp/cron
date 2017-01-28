@@ -1,0 +1,129 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * What is happening here?
+ *
+ * 1. This cron runner is called by AWS periodic tasks (cron.yaml) every minute
+ * 2. The cron runner scripts checks the database for jobs that are due
+ * 3. It then pushes these "due" jobs to Amazon SQS (message queue)
+ * 4. On the web workers, a queue-checker is running non-stop trying to receive
+ *    message from the queue and it spawns script-runners with job ids to do the jobs
+ */
+
+namespace Cron {
+
+    use App\Config\BootLoader;
+    use App\Controller\Admin\CronJobs;
+    use App\Model\MCronJob;
+    use Aws\Result;
+    use Aws\Sqs\SqsClient;
+    use Carbon\Carbon;
+    use Minute\Aws\Client;
+    use Minute\Config\Config;
+    use Minute\Database\Database;
+
+    error_reporting(E_ALL);
+    ini_set('display_errors', 'On');
+
+    require_once(realpath(__DIR__ . "/../../../../autoload.php"));
+
+    class CronRunner {
+        const TIMEOUT_SECS = 3600;
+        /**
+         * @var \PDO
+         */
+        protected $pdo;
+        /**
+         * @var SqsClient
+         */
+        protected $sqs;
+        /**
+         * @var Result
+         */
+        protected $queue_url;
+
+        /**
+         * @var Config
+         */
+        private $config;
+        /**
+         * @var Client
+         */
+        private $client;
+
+        /**
+         * CronRunner constructor.
+         *
+         * @param Database $database
+         * @param Config $config
+         * @param Client $client
+         */
+        public function __construct(Database $database, Config $config, Client $client, array $options) {
+            $this->config   = $config;
+            $this->database = $database;
+            $this->client   = $client;
+
+            $queue_name = $options['queue-name'];
+            $this->sqs  = $client->getSqsClient();
+
+            if ($queue = $this->sqs->getQueueUrl(['QueueName' => $queue_name])) {
+                $this->queue_url = $queue->get("QueueUrl");
+            }
+
+            print "Inserting new jobs in: $this->queue_url\n";
+
+            register_shutdown_function([$this, 'unlock']);
+        }
+
+        public function run() {
+            $this->lock();
+
+            $jobs = MCronJob::where('enabled', '=', 'true')->get();
+
+            /** @var MCronJob $job */
+            foreach ($jobs as $job) {
+                $elapsed = Carbon::now()->diffInSeconds(Carbon::parse($job->updated_at));
+
+                if (($elapsed > 50) && (($elapsed > self::TIMEOUT_SECS) || ($job->running === 'false'))) {
+                    $job->setAttribute('updated_at', Carbon::now())->save();
+                    $schedules = json_decode($job->schedules_json);
+
+                    foreach ($schedules as $schedule) {
+                        $str  = @join(' ', [$schedule->min, $schedule->hour, $schedule->daymonth, $schedule->month, $schedule->dayweek]);
+                        $cron = CronExpression::factory($str);
+
+                        if ($cron->isDue()) {
+                            print "Queueing job: $job->name ($job->cron_job_id) in $this->queue_url\n";
+                            $this->sqs->sendMessage(['QueueUrl' => $this->queue_url, 'MessageBody' => $job->cron_job_id]);
+                        }
+                    }
+                }
+            }
+
+            $this->unlock();
+        }
+
+        public function lock() {
+            $status  = $this->config->get(CronJobs::cronKey, [], false);
+            $elapsed = Carbon::now()->diffInSeconds(Carbon::createFromTimestamp($status['lastRun'] ?? 0));
+
+            if (!$status['running'] || ($elapsed > self::TIMEOUT_SECS)) {
+                $this->config->set(CronJobs::cronKey, ['running' => true, 'lastRun' => time()], true);
+            } else {
+                exit('Cron is already running');
+            }
+        }
+
+        public function unlock() {
+            $this->config->set(CronJobs::cronKey . '/running', false, true);
+        }
+    }
+
+    /** @var CronRunner $runner */
+    $bootLoader = new BootLoader();
+    $injector   = $bootLoader->getInjector();
+    $runner     = $injector->make('Cron\CronRunner', [':options' => getopt(null, ["input:", "queue-name:", "queue-msg-id:", "queue-path:"])]);
+
+    $runner->run();
+}
