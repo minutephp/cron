@@ -31,11 +31,11 @@
 
                 <div class="box-body">
                     <div class="list-group">
-                        <div class="list-group-item list-group-item-bar list-group-item-bar-{{job.logs.result === 'pass' && 'success' || 'danger'}}"
+                        <div class="list-group-item list-group-item-bar list-group-item-bar-{{job.logs.result === 'pass' && 'success' || 'danger'}} {{!job.enabled && 'faded' || ''}}"
                              ng-repeat="job in jobs" ng-click-container="mainCtrl.actions(job)">
                             <div class="pull-left">
                                 <h4 class="list-group-item-heading">
-                                    {{job.name | ucfirst}} - <small>{{job.description}}</small>
+                                    <b ng-show="!job.enabled" title="Disabled"><i class="fa fa-times"></i></b> {{job.name | ucfirst}} - <small>{{job.description}}</small>
                                     <small ng-show="!job.logs.result" class="text-danger" translate="">(Never run)</sup></small>
                                 </h4>
                                 <p class="list-group-item-text hidden-xs" ng-show="!!job.metadata.nextRun">
