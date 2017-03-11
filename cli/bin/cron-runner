@@ -22,6 +22,7 @@ namespace Cron {
     use Minute\Aws\Client;
     use Minute\Config\Config;
     use Minute\Database\Database;
+    use Minute\Shell\Shell;
 
     error_reporting(E_ALL);
     ini_set('display_errors', 'On');
@@ -48,9 +49,9 @@ namespace Cron {
          */
         private $config;
         /**
-         * @var Client
+         * @var Shell
          */
-        private $client;
+        private $shell;
 
         /**
          * CronRunner constructor.
@@ -58,17 +59,22 @@ namespace Cron {
          * @param Database $database
          * @param Config $config
          * @param Client $client
+         * @param array $options
+         * @param Shell $shell
          */
-        public function __construct(Database $database, Config $config, Client $client, array $options) {
+        public function __construct(Database $database, Config $config, Client $client, array $options, Shell $shell) {
             $this->config   = $config;
             $this->database = $database;
-            $this->client   = $client;
 
-            $queue_name = $options['queue-name'];
-            $this->sqs  = $client->getSqsClient();
+            if (!empty($options['queue-name'])) {
+                $queue_name = $options['queue-name'];
+                $this->sqs  = $client->getSqsClient();
 
-            if ($queue = $this->sqs->getQueueUrl(['QueueName' => $queue_name])) {
-                $this->queue_url = $queue->get("QueueUrl");
+                if ($queue = $this->sqs->getQueueUrl(['QueueName' => $queue_name])) {
+                    $this->queue_url = $queue->get("QueueUrl");
+                }
+            } else {
+                $this->shell = $shell;
             }
 
             print "Inserting new jobs in: $this->queue_url\n";
@@ -94,10 +100,20 @@ namespace Cron {
                         $cron = CronExpression::factory($str);
 
                         if ($cron->isDue()) {
-                            print "Queueing job: $job->name ($job->cron_job_id) in $this->queue_url\n";
-                            $this->sqs->sendMessage(['QueueUrl' => $this->queue_url, 'MessageBody' => $job->cron_job_id]);
+                            if (!empty($this->sqs)) {
+                                print "Queueing job: $job->name ($job->cron_job_id) in $this->queue_url\n";
+                                $this->sqs->sendMessage(['QueueUrl' => $this->queue_url, 'MessageBody' => $job->cron_job_id]);
+                            } else {
+                                $pending[] = sprintf("%s/script-runner --input=%d", __DIR__, $job->cron_job_id);
+                            }
                         }
                     }
+                }
+            }
+
+            if (!empty($pending)) {
+                foreach ($pending as $script) {
+                    $this->shell->background($script);
                 }
             }
 
